@@ -4,9 +4,9 @@ White Ball (official SPL Ball for RoboCup 2016) perceptor module. This module is
 To use this code you need to setup B-Human code release 2013. The later versions might also be working. The framework is accessible on:
 http://b-human.de/
 
-After installation of B-Human's code, replace the provided files with the orginal ones. This is all needs to done, unless there were modifications on original representations.
+After installation of B-Human's code, replace the provided files with the original ones. This is all needs to done, unless there were modifications on original representations.
 
-Since the change in the SPL rule about the ball, an entirely approach needed for detecting the ball. Because the ball is no longer has an unique color. The approach represented in this release is finding circles in the image using Random Hough Transform (RHT), afterward filter them by tring to detect the black pattern on the ball. However this code is still under development and all feature might not be applicable right now.
+Since the change in the SPL rule about the ball, an entirely approach needed for detecting the ball. Because the ball is no longer has an unique color. The approach represented in this release is finding circles in the image using Random Hough Transform (RHT), afterward filter them by trying to detect the black pattern on the ball. However this code is still under development and all feature might not be applicable right now.
 
 Feel free to use, modify or re-publish this code. And please feel free to fork the code from Github and send pull requests.
 
