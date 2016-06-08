@@ -7,7 +7,6 @@
  */
 
 #pragma once
-#define USE_RHT //-- Whether to use RHT or normal HT
 
 #include <vector>
 
@@ -22,10 +21,8 @@
 #include "Tools/Debugging/DebugImages.h"
 #include "Representations/Infrastructure/JointData.h"
 
-#include "MRL/HoughTrans.h"
-#include "MRL/EdgeDetection.h"
-#include "MRL/RHT.h"
-
+#include "MRL/EdgeImage.h"
+#include "MRL/FRHT.h"
 
 class Image;
 
@@ -44,32 +41,24 @@ END_MODULE
 
 class BallPerceptor: public BallPerceptorBase
 {
-private:
-  DECLARE_DEBUG_IMAGE(edgeImage);
-
-  void update(BallPercept& ballPercept);
 public:
   BallPerceptor();
 
 private:
-  float minWhitePercentage, minNonGreenPercentage, minBlackPercentage, maxBlackPercentage, blackCheckRatio;
-  int blackThre;
-  EdgeDetection edgeDetection;
-
-#ifndef USE_RHT
-  HoughTrans houghTrans;
-#else
-  RHT houghTrans;
-#endif
-
-  //-- @return: whether the pixel is inside the image or not
-  //-- @param: color: whether the pixel is white or not
+  void update(BallPercept& ballPercept);
   bool checkWhitePercentage(int cx, int cy, int r);
   int searchedColor(int x, int y, int& color, int& nonGreen);
-  bool refineEdges(int& x, int& y, int& r);
+  bool refineEdges(float& x, float& y, float& r);
   bool isNotGreenChecked(int x, int y);
-  bool calculateBallOnField(BallPercept& ballPercept);
   bool checkBlackPercentage(int cx, int cy, int r);
   int searchedColorForBlack(int x, int y, int& black);
-  bool isBlack(int const x, int const y) const;
+  bool isBlack(const Image::Pixel* p, const ColorReference& r);
+  bool checkBelowFieldBoundary(int x, int y, int r);
+  bool checkProjectedRadius(int x, int y, int r);
+  bool calculateBallOnField(BallPercept& ballPercept);
+  bool checkOutOfBody(int x, int y, int r);
+  void takeASnapShot(int x, int y, int r);
+
+  EdgeImage edgeImage; DECLARE_DEBUG_IMAGE(edgeImage);
+  FRHT houghTransform;
 };

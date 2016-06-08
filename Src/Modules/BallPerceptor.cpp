@@ -9,265 +9,153 @@
 
 #include "BallPerceptor.h"
 #include "Tools/Debugging/DebugDrawings.h"
-#include "Tools/Math/Matrix.h"
-#include "Tools/Streams/InStreams.h"
-#include "Representations/Perception/BallSpot.h"
-#include "Representations/Infrastructure/Image.h"
-#include "Representations/Modeling/RobotPose.h"
-#include "Representations/Modeling/BallModel.h"
 #include "Tools/Math/Geometry.h"
-#include "Representations/Perception/BallSpots.h"
 
 #include <iostream>
-#include <algorithm>
-#include <cmath>
+#include <fstream> //-- For sake of taking snap shots
+#include <ctime> //-- For sake of taking snap shots
+#include <sstream> //-- For sake of taking snap shots
+
+// [FIXME] : move these
+#define minWhitePercentage (0.35)
+#define minNonGreenPercentage (0.7)
+#define minBlackPercentage (0.04)
+#define maxBlackPercentage (0.7)
+
 
 MAKE_MODULE(BallPerceptor, Perception)
 
 BallPerceptor::BallPerceptor() :
-  edgeDetection(theImage, theColorReference),
-  houghTrans(edgeDetection),
-  minWhitePercentage(0.35),
-  minNonGreenPercentage(0.7),
-  blackThre(90),
-  minBlackPercentage(0.04),
-  maxBlackPercentage(0.5),
-  blackCheckRatio(0.65)
+  edgeImage(theImage),
+  houghTransform(edgeImage)
 {
 }
 
 void BallPerceptor::update(BallPercept& ballPercept)
 {
-  DECLARE_DEBUG_DRAWING("module:BallPerceptor:bodyRejections", "drawingOnImage");
-  DECLARE_DEBUG_DRAWING("module:BallPerceptor:Cross", "drawingOnImage");
-  DECLARE_DEBUG_DRAWING("module:BallPerceptor:blacks", "drawingOnImage");
+  static bool takeASnapShotFlag = false;
+  DEBUG_RESPONSE("module:BallPerceptor:takeSnapShot", takeASnapShotFlag = true; );
 
-  MODIFY("module:BallPerceptor:minWhitePercentage", minWhitePercentage);
-  MODIFY("module:BallPerceptor:minNonGreenPercentage", minNonGreenPercentage);
-  MODIFY("module:BallPerceptor:minBlackPercentage", minBlackPercentage);
-  MODIFY("module:BallPerceptor:maxBlackPercentage", maxBlackPercentage);
-  MODIFY("module:BallPerceptor:blackThre", blackThre);
-  MODIFY("module:BallPerceptor:blackblackCheckRatio", blackCheckRatio);
+  DECLARE_DEBUG_DRAWING("module:BallPerceptor:edgePoints", "drawingOnImage");
+  DECLARE_DEBUG_DRAWING("module:BallPerceptor:houghPoints", "drawingOnImage");
+  DECLARE_DEBUG_DRAWING("module:BallPerceptor:selectedHoughs", "drawingOnImage");
+  DECLARE_DEBUG_DRAWING("module:BallPerceptor:selectedPoints", "drawingOnImage");
 
-  COMPLEX_DRAWING("module:BallPerceptor:blacks", {
-	  for(int x = 0; x < theImage.width; x++)
-		  for(int y = 0; y < theImage.height; y++)
-			  if(isBlack(x, y))
-				  DOT("module:BallPerceptor:blacks", x, y, ColorClasses::red, ColorClasses::red);
-  });
+  DECLARE_DEBUG_DRAWING("module:BallPerceptor:searchLine", "drawingOnImage");
 
   ballPercept.ballWasSeen = false;
   ballPercept.status = BallPercept::notSeen;
 
-  edgeDetection.calculateEdge(theCameraInfo,
-      theFilteredJointData.angles[JointData::HeadYaw],
-      theFilteredJointData.angles[JointData::HeadPitch]);
+  edgeImage.isCameraUpper = theCameraInfo.camera == CameraInfo::upper;
+  edgeImage.originY = theImageCoordinateSystem.origin.y;
+  edgeImage.update();
+  houghTransform.update();
 
-  INIT_DEBUG_IMAGE(edgeImage,edgeDetection);
+  for (const auto& p : edgeImage.edgePoints())
+    DOT("module:BallPerceptor:edgePoints", p.x, p.y, ColorClasses::red, ColorClasses::red);
+
+  INIT_DEBUG_IMAGE(edgeImage,edgeImage);
   SEND_DEBUG_IMAGE(edgeImage);
 
-  houghTrans.update();
-
-  for (const auto& v : houghTrans.extractedPoints())
+  //-- Checking the hough results:
+  for (const auto& c : houghTransform.extractedCircles())
   {
-    int cx = v.x * edgeDetection.step();
-    int cy = v.y * edgeDetection.step();
-    int r = v.z * edgeDetection.step();
+    float x = c.x * edgeImage.avStep;
+    float y = c.y * edgeImage.avStep;
+    float r = c.z * edgeImage.avStep;
 
-    CIRCLE("module:BallPerceptor:Cross", cx, cy, r, 2, Drawings::bs_solid, ColorClasses::black, Drawings::bs_null, ColorClasses::black);
-
-    if (!refineEdges(cx, cy, r))
+    //-- Size Filter
+    if (r > 60 || r < 2.5)
       continue;
 
-    if (!checkWhitePercentage(cx, cy, r))
+    //-- White Percentage
+    if (!checkWhitePercentage(x, y, r))
       continue;
 
-    if (!checkBlackPercentage(cx, cy, r * blackCheckRatio))
+    if (!refineEdges(x, y, r))
       continue;
 
-    bool isInBody = false;
-    for(float i = 0;  i < 2 * M_PI; i += M_PI / 8)
-    {
-      const int x = r * cos(i) + cx;
-      const int y = r * sin(i) + cy;
-
-      int minY = y;
-      theBodyContour.clipBottom(x, minY);
-      DOT("module:BallPerceptor:bodyRejections", x, y, ColorClasses::red, ColorClasses::red);
-      DOT("module:BallPerceptor:bodyRejections", x, minY, ColorClasses::blue, ColorClasses::blue);
-      if(y > minY)
-      {
-        isInBody = true;
-        break;
-      }
-    }
-
-    if(isInBody)
+    //-- Again Checking size!
+    if (r > 60 || r < 2.5)
       continue;
 
-    //-- Check if the ball is totally inside the field
-    if (cy-r < theFieldBoundary.getBoundaryY(cx))
+    // [NOTE] : the process of checking radius and white percentage although it's heavy but it is done twice,
+    //          please note that the second one (this one down below) is done to check whether this object
+    //          has enough white pixel in it. But the first one is done to ignore refining edges for waste
+    //          object. So, however this is a heavy process, but it's reduces the time cost overly.
+    if (!checkWhitePercentage(x, y, r))
       continue;
 
-    //-- Check ball radius
-    #define BALL_WIDTH_2 50   //-- Half of the ball width // [FIXME] : this should be a config
-    #define BALL_WIDTH   100  //-- ball width             // [FIXME] : this should be a config
-
-    Vector3<> projectedLeft,projectedRight;
-    bool isProjected = Geometry::calculatePointOnField(Vector2<>(cx-r, cy), BALL_WIDTH_2, theCameraMatrix, theCameraInfo, projectedLeft) &&
-                       Geometry::calculatePointOnField(Vector2<>(cx+r, cy), BALL_WIDTH_2, theCameraMatrix, theCameraInfo, projectedRight);
-
-    if (abs(abs(projectedLeft.y - projectedRight.y) - BALL_WIDTH) > 50)
-    {
-      DRAWTEXT("module:BallPerceptor:Cross", cx, -cy, 10, ColorClasses::yellow, projectedLeft.y - projectedRight.y);
-      CIRCLE("module:BallPerceptor:Cross", cx, cy, r, 2, Drawings::bs_solid, ColorClasses::yellow, Drawings::bs_null, ColorClasses::yellow);
+    //-- White / Black Percentage
+    if (!checkBlackPercentage(x, y, r))
       continue;
-    }
 
-    CIRCLE("module:BallPerceptor:Cross", cx, cy, r, 2, Drawings::bs_solid, ColorClasses::red, Drawings::bs_null, ColorClasses::red);
+    if (!checkBelowFieldBoundary(x, y, r))
+     continue;
+
+    //-- Actual Size check
+    if (!checkProjectedRadius(x, y, r))
+      continue;
+
+    if (!checkOutOfBody(x, y, r))
+      continue;
+
+    CIRCLE("module:BallPerceptor:selectedHoughs", x,y,r,1, Drawings::bs_solid, ColorClasses::red, Drawings::bs_null, ColorClasses::red);
 
     //-- Exporting results
     if (theCameraMatrix.isValid)
     {
-      ballPercept.positionInImage = Vector2<>(cx, cy);
+      ballPercept.positionInImage = Vector2<>(x, y);
       ballPercept.radiusInImage = r;
       Geometry::Circle c;
       if(calculateBallOnField(ballPercept))
       {
         ballPercept.status = BallPercept::seen;
         ballPercept.ballWasSeen = true;
+        if (takeASnapShotFlag)
+        {
+          takeASnapShot(x,y,r);
+          takeASnapShotFlag = false;
+        }
+
+        return;
       }
-//      if (Geometry::calculateBallInImage(ballPercept.positionInImage, theCameraMatrix, theCameraInfo, ballPercept.radiusInImage, c))
-//      {
-//        ballPercept.status = BallPercept::seen;
-//        ballPercept.ballWasSeen = true;
-//        ballPercept.relativePositionOnField = Vector2<>(c.center.y, c.center.x);
-//        return;
-//      }
     }
-  }//-- End of every extracted points
+  }
 }
 
-//-- This function has to be on the global space
-bool comparePoints(const Vector3i& a, const Vector3i& b)
+bool BallPerceptor::checkOutOfBody(int cx, int cy, int r)
 {
-  return a.z < b.z;
-}
-
-bool BallPerceptor::refineEdges(int& x, int& y, int& r)
-{
-  // [TODO] : optimize this function. This can be done by binary search or something to reduce the complexity
-
-  //   p7 p0  p1
-  //    \ | /
-  //     \|/
-  // p6 --O-- p2
-  //     /|\
-  //    / | \
-  //   p5 p4 p3
-
-  // [FIXME] : do something about data types
-  Vector2i p0 = Vector2i(x,   y-r); //-- Vertical
-  Vector2i p1 = Vector2i(x+r, y-r);
-  Vector2i p2 = Vector2i(x+r, y);   //-- Horizontal
-  Vector2i p3 = Vector2i(x+r, y+r);
-  Vector2i p4 = Vector2i(x  , y+r); //-- Vertical
-  Vector2i p5 = Vector2i(x-r, y+r);
-  Vector2i p6 = Vector2i(x-r, y);   //-- Horizontal
-  Vector2i p7 = Vector2i(x-r, y-r);
-
-  std::vector<Vector3i> points; // x, y, distance from center
-
-  for (; isNotGreenChecked(p0.x, p0.y); --p0.y); points.push_back(Vector3i(p0.x, p0.y, y-p0.y));
-  for (; isNotGreenChecked(p2.x, p2.y); ++p2.x); points.push_back(Vector3i(p2.x, p2.y, p2.x-x));
-  for (; isNotGreenChecked(p4.x, p4.y); ++p4.y); points.push_back(Vector3i(p4.x, p4.y, p4.y-y));
-  for (; isNotGreenChecked(p6.x, p6.y); --p6.x); points.push_back(Vector3i(p6.x, p6.y, x-p6.x));
-
-  for (; isNotGreenChecked(p1.x, p1.y); --p1.y, ++p1.x); points.push_back(Vector3i(p1.x, p1.y, y-p1.y));
-  for (; isNotGreenChecked(p3.x, p3.y); ++p3.y, ++p3.x); points.push_back(Vector3i(p3.x, p3.y, p3.y-y));
-  for (; isNotGreenChecked(p5.x, p5.y); ++p5.y, --p5.x); points.push_back(Vector3i(p5.x, p5.y, p5.y-y));
-  for (; isNotGreenChecked(p7.x, p7.y); --p7.y, --p7.x); points.push_back(Vector3i(p7.x, p7.y, y-p7.y));
-
-//  std::sort(points.begin(), points.end(), comparePoints);
-//  //-- Remove 3 most outliers always
-//  for (unsigned i=0; i<3; ++i)
-//    points.pop_back();
-
-  int maxX = points.at(0).x,
-      minX = points.at(0).x,
-      maxY = points.at(0).y,
-      minY = points.at(0).y;
-
-  for (const auto& p : points)
+  for(float i = 0;  i < 2 * M_PI; i += M_PI / 8)
   {
-    if (maxX < p.x)
-      maxX = p.x;
-    if (minX > p.x)
-      minX = p.x;
+    const int x = r * cos(i) + cx;
+    const int y = r * sin(i) + cy;
 
-    if (maxY < p.y)
-      maxY = p.y;
-    if (minY > p.y)
-      minY = p.y;
+    int minY = y;
+    theBodyContour.clipBottom(x, minY);
+    if(y > minY)
+      return false;
   }
-
-  x = (maxX+minX)/2;
-  y = (maxY+minY)/2;
-  r = (maxX-minX)/2;
-
-//  p0 = Vector2i(points.back().x, points.back().y); points.pop_back();
-//  p1 = Vector2i(points.back().x, points.back().y); points.pop_back();
-//  p2 = Vector2i(points.back().x, points.back().y); points.pop_back();
-//
-//  const Vector3f m = RHT::fitACircle(p0, p1, p2);
-//  x = m.x;
-//  y = m.y;
-//  r = m.z;
-
-  return true; // [FIXME] : The rest is refining the fitted circles, which turned out to not be useful enough.
-
-  std::vector<Vector3f> circles;
-  const unsigned pointSize = points.size();
-  for (unsigned i=0; i<pointSize; ++i)
-    for (unsigned j=i+1; j<pointSize; ++j)
-      for (unsigned k=j+1; k<pointSize; ++k)
-        circles.push_back(RHT::fitACircle(
-            Vector2i(points[i].x, points[i].y),
-            Vector2i(points[j].x, points[j].y),
-            Vector2i(points[k].x, points[k].y)));
-
-  Vector3f mean;
-  for (auto c : circles)
-    mean += c;
-  mean /= circles.size();
-
-  x = mean.x;
-  y = mean.y;
-  r = mean.z;
-
-  Vector3f var;
-  for (auto c : circles)
-  {
-    const Vector3f distance = c - mean;
-    var[0] += distance[0] * distance[0];
-    var[1] += distance[1] * distance[1];
-    var[2] += distance[2] * distance[2];
-  }
-  var /= (circles.size() - 1);
-
-  Vector3f const invalidity = Vector3f(sqrt(var[0]), sqrt(var[1]), sqrt(var[2])) / mean.z;
-
-  if(invalidity[0] < 2 || invalidity[1] < 2 || invalidity[2] < 2)
-    return false;
-
   return true;
 }
 
-bool BallPerceptor::isNotGreenChecked(int x, int y)
+bool BallPerceptor::checkBelowFieldBoundary(int x, int y, int r)
 {
-  if (x > -1 && x < theImage.width && y > -1 && y < theImage.height)
-    return !theColorReference.isGreen(theImage[y]+x);
-  return false;
+  //-- Check if the ball is totally inside the field
+  return (y-r > theFieldBoundary.getBoundaryY(x));
+}
+
+bool BallPerceptor::checkProjectedRadius(int cx, int cy, int r)
+{
+  //-- Check ball radius
+#define BALL_WIDTH_2 50   //-- Half of the ball width // [FIXME] : this should be a config
+#define BALL_WIDTH   100  //-- ball width             // [FIXME] : this should be a config
+
+  Vector3<> projectedLeft,projectedRight;
+  bool isProjected = Geometry::calculatePointOnField(Vector2<>(cx-r, cy), BALL_WIDTH_2, theCameraMatrix, theCameraInfo, projectedLeft) &&
+      Geometry::calculatePointOnField(Vector2<>(cx+r, cy), BALL_WIDTH_2, theCameraMatrix, theCameraInfo, projectedRight);
+
+  return (abs(abs(projectedLeft.y - projectedRight.y) - BALL_WIDTH) < 50);
 }
 
 bool BallPerceptor::checkWhitePercentage(int cx, int cy, int r)
@@ -296,6 +184,52 @@ bool BallPerceptor::checkWhitePercentage(int cx, int cy, int r)
   return true;
 }
 
+int BallPerceptor::searchedColor(int x, int y, int& color, int& nonGreen)
+{
+  if (x > -1 && x < theImage.width && y > -1 && y < theImage.height)
+  {
+    nonGreen += theColorReference.isGreen(theImage[y]+x)?0:1;
+    color += theColorReference.isWhite(theImage[y]+x);
+    return 1;
+  }
+  return 0;
+}
+
+#define SEARCH_STEP(limit, startRadius, countingFormula, condtion, exportFunction, debug) \
+  { \
+    const int _limit = limit; \
+    int step = startRadius; \
+    for (int p=0; p<_limit && step > 0; ) \
+    { \
+      const int c = countingFormula; \
+      if (condtion) \
+      { \
+        step /= 2; \
+        continue; \
+      } \
+      p += step; \
+      exportFunction; \
+      debug; \
+    } \
+  }
+
+bool BallPerceptor::refineEdges(float& X, float& Y, float& R)
+{
+  Vector2i topLeft;
+  Vector2i bottomRight;
+
+  SEARCH_STEP(theImage.width - X, R, X+(p+step), theColorReference.isGreen(theImage[Y]+c),      bottomRight.x = c, LINE("module:BallPerceptor:searchLine", X, Y, c, Y, 1, Drawings::bs_solid, ColorClasses::green););
+  SEARCH_STEP(                 X, R, X-(p+step), theColorReference.isGreen(theImage[Y]+c),      topLeft.x = c,     LINE("module:BallPerceptor:searchLine", X, Y, c, Y, 1, Drawings::bs_solid, ColorClasses::green););
+  SEARCH_STEP(theImage.height- Y, R, Y+(p+step), theColorReference.isGreen(theImage[c]+(int)X), bottomRight.y = c, LINE("module:BallPerceptor:searchLine", X, Y, X, c, 1, Drawings::bs_solid, ColorClasses::green););
+  SEARCH_STEP(                 Y, R, Y-(p+step), theColorReference.isGreen(theImage[c]+(int)X), topLeft.y = c,     LINE("module:BallPerceptor:searchLine", X, Y, X, c, 1, Drawings::bs_solid, ColorClasses::green););
+
+  X = (topLeft.x + bottomRight.x) / 2;
+  Y = (topLeft.y + bottomRight.y) / 2;
+  R = ((bottomRight.x - topLeft.x) / 2 + (bottomRight.y - topLeft.y) / 2) / 2;
+
+  return true;
+}
+
 bool BallPerceptor::checkBlackPercentage(int cx, int cy, int r)
 {
   int blackPixels = 0, totalSearchedPixel=0;
@@ -316,35 +250,24 @@ bool BallPerceptor::checkBlackPercentage(int cx, int cy, int r)
     return false;
 
   if ((float)blackPixels/(float)totalSearchedPixel < minBlackPercentage ||
-	  (float)blackPixels/(float)totalSearchedPixel > maxBlackPercentage)
+    (float)blackPixels/(float)totalSearchedPixel > maxBlackPercentage)
     return false;
   return true;
-}
-
-int BallPerceptor::searchedColor(int x, int y, int& color, int& nonGreen)
-{
-  if (x > -1 && x < theImage.width && y > -1 && y < theImage.height)
-  {
-    nonGreen += theColorReference.isGreen(theImage[y]+x)?0:1;
-    color += theColorReference.isWhite(theImage[y]+x);
-    return 1;
-  }
-  return 0;
 }
 
 int BallPerceptor::searchedColorForBlack(int x, int y, int& black)
 {
   if (x > -1 && x < theImage.width && y > -1 && y < theImage.height)
   {
-    black += isBlack(x, y);
+    black += isBlack(theImage[y]+x, theColorReference);
     return 1;
   }
   return 0;
 }
 
-bool BallPerceptor::isBlack(int const x, int const y) const
+bool BallPerceptor::isBlack(const Image::Pixel* p, const ColorReference& r)
 {
-	return theImage[y][x].y < blackThre && !theColorReference.isGreen(theImage[y]+x) && !theColorReference.isBlue(theImage[y]+x);
+	return r.isOrange(p) && !r.isGreen(p) && !r.isBlue(p);
 }
 
 bool BallPerceptor::calculateBallOnField(BallPercept& ballPercept)
@@ -371,3 +294,67 @@ bool BallPerceptor::calculateBallOnField(BallPercept& ballPercept)
   }
   return true;
 }
+
+void BallPerceptor::takeASnapShot(int cx, int cy, int r)
+{
+  static int nameCFO = 0;
+  std::stringstream fileNameImage;
+  std::stringstream fileNameMeta;
+  fileNameImage << "/home/mrlspl/logs/SnapShot_" << time(0) << "_" << nameCFO << ".image";
+  fileNameMeta  << "/home/mrlspl/logs/SnapShot_" << time(0) << "_" << nameCFO << ".meta";
+
+  std::ofstream outFileImage(fileNameImage.str(), std::ios::out | std::ios::binary | std::ios::trunc);
+  std::ofstream outFileMeta(fileNameMeta.str(),   std::ios::out | std::ios::trunc);
+  if (!outFileImage)
+  {
+    std::cerr << "Can not create output file image...\n";
+    return;
+  }
+  if (!outFileMeta)
+  {
+    std::cerr << "Can not create output file meta-data...\n";
+    return;
+  }
+
+#define BUFFER_WIDTH 30
+#define BUFFER_SIZE (BUFFER_WIDTH*BUFFER_WIDTH*3)
+
+  unsigned char dataBuffer[BUFFER_SIZE];
+  for (unsigned j=0; j<BUFFER_WIDTH; ++j)
+    for (unsigned i=0; i<BUFFER_WIDTH; ++i)
+    {
+      const int x = (2*r*i/BUFFER_WIDTH + cx - r);
+      const int y = (2*r*j/BUFFER_WIDTH + cy - r);
+
+      if (x > -1 && x < theImage.width && y > -1 && y < theImage.height)
+      {
+        dataBuffer[j*BUFFER_WIDTH*3+i*3+0] = theImage[y][x].y;
+        dataBuffer[j*BUFFER_WIDTH*3+i*3+1] = theImage[y][x].cb;
+        dataBuffer[j*BUFFER_WIDTH*3+i*3+2] = theImage[y][x].cr;
+      }
+      else
+      {
+        dataBuffer[j*BUFFER_WIDTH*3+i*3+0] = 0;
+        dataBuffer[j*BUFFER_WIDTH*3+i*3+1] = 0;
+        dataBuffer[j*BUFFER_WIDTH*3+i*3+2] = 0;
+      }
+    }
+
+  outFileImage.write((const char*)dataBuffer, BUFFER_SIZE);
+  outFileImage.close();
+
+  outFileMeta << BUFFER_SIZE << " # Buffer Size\n"
+              << BUFFER_WIDTH << " # Buffer Width\n"
+              << BUFFER_WIDTH << " # Buffer Height\n"
+              << cx << " # Ball X\n"
+              << cy << " # Ball Y\n"
+              << r << " # Ball Radius\n"
+              << theImageCoordinateSystem.origin.y << " # Horizon Y \n"
+              << theImage.width << " # Frame Width\n"
+              << theImage.height << " # Frame Height\n";
+  outFileMeta.close();
+
+  if (nameCFO++ > 9876)
+    nameCFO = 0;
+}
+
